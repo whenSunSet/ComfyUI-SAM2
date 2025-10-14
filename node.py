@@ -8,6 +8,7 @@ import torch
 import numpy as np
 from PIL import Image
 import logging
+import json
 from torch.hub import download_url_to_file
 from urllib.parse import urlparse
 import folder_paths
@@ -355,6 +356,88 @@ class InvertMask:
         return (out,)
 
 
+class GroundingDinoDetector:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "grounding_dino_model": ("GROUNDING_DINO_MODEL", {}),
+                "image": ("IMAGE", {}),
+                "prompt": ("STRING", {"default": "person"}),
+                "threshold": (
+                    "FLOAT",
+                    {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    CATEGORY = "segment_anything2"
+    FUNCTION = "main"
+    RETURN_TYPES = ("BBOX", "STRING", "BBOX", "BBOX", "STRING")
+    RETURN_NAMES = ("bboxes", "coordinates", "bboxes_xywh", "bboxes_visualize", "bboxes_sam2")
+
+    def main(self, grounding_dino_model, image, prompt, threshold):
+        res_bboxes = []
+        res_coordinates = []
+        res_bboxes_xywh = []
+        res_bboxes_visualize = []
+        res_bboxes_sam2 = []  # 改为列表以支持批量格式
+        
+        for item in image:
+            # 转换图像格式
+            item_pil = Image.fromarray(
+                np.clip(255.0 * item.cpu().numpy(), 0, 255).astype(np.uint8)
+            ).convert("RGB")
+            
+            # 使用DINO进行检测
+            boxes = groundingdino_predict(grounding_dino_model, item_pil, prompt, threshold)
+            print("========> [GD] =========>", boxes)
+            if boxes.shape[0] == 0:
+                # 没有检测到目标，返回空结果
+                res_bboxes.append([])
+                res_coordinates.append("[]")
+                res_bboxes_xywh.append([])
+                res_bboxes_visualize.append([0, 0, 0, 0])  # 空框
+                res_bboxes_sam2.append('{"x1": 0, "y1": 0, "x2": 0, "y2": 0}')  # 空框
+                continue
+            
+            # 转换坐标格式
+            boxes_list = []
+            boxes_xywh_list = []
+            coordinates_list = []
+            
+            # 为BboxVisualize准备格式：每张图只取第一个检测框
+            first_box = boxes[0].tolist()
+            x1, y1, x2, y2 = first_box
+            # BboxVisualize期望的格式：[x1, y1, x2, y2]
+            res_bboxes_visualize.append([x1, y1, x2, y2])
+            
+            # 为SAM2准备格式：每张图取第一个检测框，格式为JSON字符串
+            sam2_box = {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)}
+            res_bboxes_sam2.append(json.dumps(sam2_box))
+            
+            for box in boxes:
+                x1, y1, x2, y2 = box.tolist()
+                # 转换为ComfyUI的BBOX格式 [x1, y1, x2, y2]
+                boxes_list.append([x1, y1, x2, y2])
+                
+                # 转换为BboxVisualize的xywh格式 [x, y, width, height]
+                width = x2 - x1
+                height = y2 - y1
+                boxes_xywh_list.append([x1, y1, width, height])
+                
+                # 计算中心点坐标
+                center_x = int((x1 + x2) / 2)
+                center_y = int((y1 + y2) / 2)
+                coordinates_list.append({"x": center_x, "y": center_y})
+            
+            res_bboxes.append(boxes_list)
+            res_bboxes_xywh.append(boxes_xywh_list)
+            res_coordinates.append(str(coordinates_list).replace("'", '"'))
+        
+        return (res_bboxes, res_coordinates, res_bboxes_xywh, res_bboxes_visualize, res_bboxes_sam2)
+
+
 class IsMaskEmptyNode:
     @classmethod
     def INPUT_TYPES(s):
@@ -372,3 +455,54 @@ class IsMaskEmptyNode:
 
     def main(self, mask):
         return (torch.all(mask == 0).int().item(),)
+
+
+class BboxSam2IndexSelector:
+    """
+    从 bboxes_sam2 列表中提取指定索引的值
+    输入: bboxes_sam2 列表 (来自 GroundingDinoDetector 的输出)
+    输出: 指定索引位置的 bbox_sam2 值
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "bboxes_sam2": ("STRING", {}),  # 来自 GroundingDinoDetector 的 bboxes_sam2 输出
+                "index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
+            }
+        }
+
+    CATEGORY = "segment_anything2"
+    FUNCTION = "main"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("bbox_sam2",)
+
+    def main(self, bboxes_sam2, index):
+        """
+        从 bboxes_sam2 列表中提取指定索引的值
+        
+        Args:
+            bboxes_sam2: 字符串列表，每个元素是 JSON 格式的 bbox
+            index: 要提取的索引位置
+            
+        Returns:
+            指定索引位置的 bbox_sam2 值
+        """
+        # 确保 bboxes_sam2 是列表
+        if not isinstance(bboxes_sam2, list):
+            # 如果不是列表，尝试解析为列表
+            try:
+                import ast
+                bboxes_sam2 = ast.literal_eval(bboxes_sam2)
+            except:
+                # 如果解析失败，返回空框
+                return ('{"x1": 0, "y1": 0, "x2": 0, "y2": 0}',)
+        
+        # 检查索引是否有效
+        if index < 0 or index >= len(bboxes_sam2):
+            # 索引超出范围，返回空框
+            return ('{"x1": 0, "y1": 0, "x2": 0, "y2": 0}',)
+        
+        # 返回指定索引的值
+        return (bboxes_sam2[index],)
